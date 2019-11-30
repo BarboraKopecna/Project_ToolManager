@@ -1,0 +1,289 @@
+import pandas as pd 
+import datetime
+import time
+from openpyxl import Workbook
+import numpy as np
+import pyodbc
+import sqlalchemy
+from sqlalchemy import create_engine
+import urllib.parse
+import pytz
+from business_duration import businessDuration
+import holidays as pyholidays
+from datetime import time
+from itertools import repeat
+from datetime import datetime
+from pytz import timezone
+from workalendar.asia import China, SouthKorea
+
+
+#pripojeni k SQL databazi
+server = 'tfprojekt.database.windows.net'
+database = 'tfprojekt'
+username = 'tfprojekt'
+password = 'Thermo2019'
+driver = '{ODBC Driver 17 for SQL Server}'
+
+odbc_str = 'DRIVER='+driver+';SERVER='+server+';PORT=1433;UID='+username+';DATABASE='+ database + ';PWD='+ password
+connect_str = 'mssql+pyodbc:///?odbc_connect=' + urllib.parse.quote_plus(odbc_str)
+engine = create_engine(connect_str)
+
+
+#nacteni tabulky excel Brna a zbytku sveta ze souboru do pandas
+dataBro = pd.read_excel('TMEvents_BRO.xlsx')
+dataOutBro = pd.read_excel('TMEvents_outBRO.xlsx')
+
+#spoji oba excely pod sebe bez hlavicky (musi byt stejne sloupce)
+dataWorld = pd.concat([dataBro,dataOutBro], sort=False)
+#opravuje indexovani rows, defaultne je to jak si pandas mysli, ale timto to upravim na 0-n
+dataWorld = dataWorld.reset_index(drop=True)
+
+#nacteni csv s modely mikroskopu do pandas, pro pozdejsi najiti modelu pro kazdy radek, kde je nazev mikroskopu
+modelMic = pd.read_csv('microscopes_models.csv', delimiter=',')
+
+#zkopiruje cely sloupec s novym nazvem
+dataWorld.insert(3, "LaboratoryCorrect", dataWorld.Laboratory) 
+
+#slovnik na prevod vsech nazvu mikroskopu na název, kde je na zacatku zkratka mesta a za nim strednik
+slovnik_lab = {'BRO R&D lab': 'Brno;R&D lab', 'BRO R&D IDT': 'Brno;R&D IDT',
+            'BRO CT TEM': 'Brno;CT TEM', 'BRO PE': 'Brno;PE',
+            'BRO TSG': 'Brno;TSG', 'BRO CT&OE BEA': 'Brno;CT&OE BEA',
+            'BRO EMU Univ.': 'Brno;EMU Univ.', 'HBO Apps Dev': 'Hillsboro;Apps Dev', 
+            'HBO BT': 'Hillsboro;BT', 'HBO Nanoport': 'Hillsboro;Nanoport',
+            'Shanghai Nanoport': 'Shanghai;Nanoport',
+            'HBO R&D': 'Hillsboro;R&D', 'EMU Univ. Shanghai': 'Shanghai;EMU Univ.',
+            'EMU Univ. Acht': 'Eindhoven;EMU Univ. ', 'Acht R&D TEM': 'Eindhoven;R&D TEM',
+            'Acht R&D Other': 'Eindhoven;R&D Other', 'Eindhoven NanoPort': 'Eindhoven;NanoPort',
+            'FEI Univ.Hillsboro': 'Hillsboro;FEI Univ.', 'Korea lab': 'Soul;lab'}
+
+#v novem sloupci jsou sites i se strednikem
+dataWorld.replace({"LaboratoryCorrect": slovnik_lab}, inplace = True) # v novem sloupci jsou sites i se strednikem
+
+#strednikem; rozdelim novy sloupec na dva
+dataWorld[['City','LabName']] = dataWorld.LaboratoryCorrect.str.split(";", expand=True) 
+
+
+#---------------------------------------------
+#CYKLUS NA POROVNANI LISTU MODELU S LISTEM NAZVU MIKROSKOPU, VYPSANI MODELU K PRISLUSNEMU RADKU
+#dataBro.Microscope je tzv Series, prevedeme to na list
+listToCompare = list(dataWorld.Microscope)
+#print(listToCompare)
+
+#tady je modelMic datovy typ Dataframe, v pandas se prevede do listu
+list_of_listModel = modelMic.values.tolist()
+#print(list_of_listModel)
+#list_of_listModel je list listů - zkusit si vyprintovat, pro nahled
+
+#cyklus pro udelani tzv flat listu - 1 list (z listu listu)
+listModel = []
+for sublist in list_of_listModel:
+    for item in sublist:
+        listModel.append(item)
+#print(listModel)
+
+#tady se ulozi list porovnanych modelu
+list_results = [] 
+#pro hodnotu v slozeninach
+for value in listToCompare:
+    #docasny list, do ktereho se ulozi i prazdne hodnoty
+    temporary_model = ""
+    #pro kazdy model v modelech
+    for model in listModel:
+        #zkontroluje jestli model je v slozenine a ignoruje case a mezery
+        if ''.join(model.split()).lower() in ''.join(value.split()).lower():
+            #pokud ano uloz si hodnotu do docasne promennne
+            temporary_model = model
+    #toto se provede po porovnani se vsemi modely,
+    #pokud je promenna neprazdna, pridej obsah promenné do listu vysledku
+    if temporary_model != "":
+        list_results.append(temporary_model)
+    #pokud je promenna prazdna pridej slovo 'Nenalezeno'
+    else:
+        list_results.append("Nenalezeno")
+
+#prevod zpet (z listu) na datovy typ Series, ktery se pouziva v pandas
+clean_Microscope = pd.Series(list_results)
+#pridany sloupec se samotnym nazvem modelu
+dataWorld['Model'] = clean_Microscope
+#------------------------------------------------------------
+#abychom mohly radit dle casu, prevedla jsem pomocny sloupec na datetime
+dataWorld['CreatedTime'] = pd.to_datetime(dataWorld['Created'])
+#serazeni dvou sloupcu, nejdrive da dohromady dle nazvu microskopu, pak datumu s casem
+dataWorld.sort_values(["Microscope", "CreatedTime"], axis=0, 
+                 ascending=True, inplace=True) 
+
+#po serazeni se opet rozhodi indexace radku, tak ji dam od 0 az po n
+dataWorld = dataWorld.reset_index(drop=True)
+
+#------------------------------------------------------------
+#timezones pro jednotliva mesta z reportu
+hillsboro = timezone('America/Vancouver')
+shanghai = timezone('Asia/Shanghai')
+eidhoven = timezone('Europe/Amsterdam')
+prague = timezone('Europe/Prague')
+japan = timezone('Japan')
+
+#prevod na list se Series
+created_time = list(dataWorld['Created'])
+list_cities = list(dataWorld['City'])
+
+#pridani timezones k datetime
+i = 0
+datetime_correct = []
+for dtime in dataWorld['Created']:
+    #format
+    date_to_datetime = datetime.strptime(dtime, '%d/%b/%Y %H:%M:%S')
+    #u vsech je prague time (+2 v lete +1 v zime)
+    datetime_timezone = prague.localize(date_to_datetime)
+
+    #podle mesta z prazskeho casu do toho, ve kterem se nachazi mesto
+    if list_cities[i] == "Brno":
+        datetime_correct.append(datetime_timezone)
+    elif list_cities[i] == "Hillsboro":
+        datetime_correct.append(datetime_timezone.astimezone(hillsboro))
+    elif list_cities[i] == "Eindhoven":
+        datetime_correct.append(datetime_timezone.astimezone(eidhoven))
+    elif list_cities[i] == "Shanghai":
+        datetime_correct.append(datetime_timezone.astimezone(shanghai))
+    elif list_cities[i] == "Soul":
+        datetime_correct.append(datetime_timezone.astimezone(japan))
+    i += 1
+
+
+#slovniky s holidays (udelano pomoci list comprehension (zkraceny for cyklus))
+
+china_holiday_workalendar_eight = China().holidays(2018)
+dict1_s = dict((x, y) for x, y in china_holiday_workalendar_eight)
+china_holiday_workalendar_nine = China().holidays(2019)
+dict2_s = dict((x, y) for x, y in china_holiday_workalendar_nine)
+dict2_s.update(dict1_s)
+
+korea_holiday_workalendar_eight = SouthKorea().holidays(2018)
+dict1_k = dict((x, y) for x, y in korea_holiday_workalendar_eight)
+korea_holiday_workalendar_nine = SouthKorea().holidays(2019)
+dict2_k = dict((x, y) for x, y in korea_holiday_workalendar_nine)
+dict2_k.update(dict1_k)
+
+dict1_b = pyholidays.Czechia(years=2018)
+dict2_b = pyholidays.Czechia(years=2019)
+dict2_b.update(dict1_b)
+
+dict1_h = pyholidays.UnitedStates(state='OR', years=2018)
+dict2_h = pyholidays.UnitedStates(state='OR', years=2019)
+dict2_h.update(dict1_h)
+
+dict1_e = pyholidays.Netherlands(years=2018)
+dict2_e = pyholidays.Netherlands(years=2019)
+dict2_e.update(dict1_e)
+
+
+#Slovnik se vsemi holidays, klice jsou presne nazvy mest ktere jsou v datech
+holidays_dict = {'Brno': dict2_b,
+                 'Hillsboro': dict2_h,
+                 'Eindhoven': dict2_e,
+                 'Shanghai': dict2_s,
+                 'Soul': dict2_k
+                 }
+
+
+# BUSINESS DURATION CYKLUS
+#urcime pracovni dobu od-do
+biz_open_time = time(8, 0, 0)
+biz_close_time = time(17, 0, 0)
+#urcime velicinu
+unit_time = 'hour' 
+#nastavime, ktere dny jsu vikend z 0-6 (0-pondeli)
+weekend_list = [5, 6]
+
+business_duration = []
+city_col = list(dataWorld.City)
+time_col = datetime_correct
+name_col = list(dataWorld.Microscope)
+
+#pohlidame si delku sloupce
+for i in range(len(city_col)):
+    first_row = i
+    second_row = i + 1
+    if second_row == len(city_col):
+        business_duration.append("")
+#jestli se radky se jmenem mikroskopu rovnaji
+    elif name_col[second_row] == name_col[first_row]:
+        #urcime, ktery radek je zacate a ktery konec obdobi
+        start_d = pd.to_datetime(datetime_correct[first_row])
+        end_d = pd.to_datetime(datetime_correct[second_row])
+
+        # ve slovniku holiday_dicst podle klice (sloupec city_col na prvnim
+        # radku), hodnota klice je prave ten slovnik s holidays (hodnotou
+        # klice v holidays_dict je proste dalsi slovnik)
+        country_holiday = holidays_dict[city_col[first_row]]
+        #modul na pocitani businesshours, zada se zacatek, konec, od do pracovni doba cas, kdy vikendu a slovnik s holidays workalendar 7.1.1
+        duration = businessDuration(startdate=start_d,
+                                    enddate=end_d,
+                                    starttime=biz_open_time,
+                                    endtime=biz_close_time,
+                                    weekendlist=weekend_list,
+                                    holidaylist=country_holiday,
+                                    unit=unit_time)
+        business_duration.append(duration)
+    else:
+        business_duration.append("") #Not same microscope
+
+
+#prevod z listu na pandas series
+Cities = pd.Series(list_cities)
+Date = pd.Series(datetime_correct)
+Duration = pd.Series(business_duration)
+
+#nove series(sloupce) v dataframe
+dataWorld['DateTimezoned'] = Date
+dataWorld['DurationBusinessHours'] = Duration
+
+#------------------------------------------------------------
+#CYKLUS NA VYPOCET A PRIDAVANI ROZDILU CASU DO NOVEHO SLOUPCE DURATION
+time_col = dataWorld.Created
+name_col = dataWorld.Microscope
+
+#vsechny vystupy viz nize, ukladam do noveho listu 
+list_duration = []
+list_duration1 = []
+
+for i in range(len(time_col)):
+    first_row = i
+    second_row = i + 1
+    #prvne zkontroluju jestli jeste mam s cim porovnavat, jestli nejsem na konci sloupce
+    #kdyz jsem na konci, napise se, ze je konec sloupce(muzeme na cokoli zmenit)
+    if second_row == len(time_col):
+        list_duration.append("")
+        
+    #pokud mam dalsi radky, tak porovnavam jestli se dve jmena mikroskopu rovnaji
+    elif name_col[second_row] == name_col[first_row]:
+        date_first = pd.to_datetime(time_col[first_row])
+        date_second = pd.to_datetime(time_col[second_row])
+        duration = date_second - date_first
+        list_duration.append(duration)
+               
+    #pokud ne, tak vypisu ze se neshoduje
+    else:
+        list_duration.append("")
+        
+#prevod zpet (z listu) na datovy typ Series, ktery se pouziva v pandas
+Time = pd.Series(list_duration)
+#vytvoreni sloupce s duration
+dataWorld['DurationRaw'] = Time
+
+#dataWorld['DurationRaw1'] = pd.to_datetime(dataWorld['DurationRaw'])
+
+#prevod z formatu 3days 01:10:25, /60 a /60 prevedeno na hodiny
+dataWorld['DurationRawHours']=(dataWorld.DurationRaw.astype('timedelta64[s]')/60)/60
+
+#---------------------------------------------------------------------------------------------------------------------------------
+#EXPORT DO CSV + ODESLANI DO SQL DATABAZE
+#export do csv
+dataWorld.to_csv('ToolManager.csv', sep=',', index = False)
+
+#odeslani do SQL
+coltype = {'CreatedTime': sqlalchemy.types.DateTime, 'DateTimezoned': sqlalchemy.types.DateTime, 'DurationRaw': sqlalchemy.types.Numeric}
+
+dataWorld.to_sql('ToolManager', engine, if_exists='replace', index=False, dtype=coltype) 
+
+print(dataWorld)
